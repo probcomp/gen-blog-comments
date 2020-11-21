@@ -45,7 +45,7 @@ const von_mises = VonMises()
 # generative model #
 ####################
 
-@gen function model()
+@gen function heading_model()
     x ~ normal(1.0, 1.0)
     y ~ normal(0.0, 1.0)
     heading = atan(y, x)
@@ -83,7 +83,7 @@ sigmoid(x) = 1 ./ (1 .+ exp.(-x))
 end
 
 function data_generator()
-    trace = simulate(model, ())
+    trace = simulate(heading_model, ())
     return (((trace[:measured_heading],), get_choices(trace)))
 end
 
@@ -139,7 +139,7 @@ end
 
 function load_q_amortized_params()
     params = load("params.jld")
-    println(keys(params))
+    println("loading params for q_amortized, got: $(keys(params))")
     for name in [:b1, :W1, :b2, :W2, :b3, :W3]
         set_param!(q_amortized, name, params[String(name)])
     end
@@ -153,7 +153,7 @@ function nn_inference(measured_heading::Float64, num_samples::Int)
     for i in 1:num_samples
         trace = simulate(q_amortized, (measured_heading,))
         push!(traces, trace)
-        _, model_score = generate(model, (), merge(get_choices(trace), choicemap((:measured_heading, measured_heading))))
+        _, model_score = generate(heading_model, (), merge(get_choices(trace), choicemap((:measured_heading, measured_heading))))
         push!(elbo_ests, model_score - get_score(trace))
         
     end
@@ -173,11 +173,9 @@ function bbvi_inference(
     init_param!(q, :y_log_std, 0.0)
 
     # fit parameters using BBVI
-    #update = ParamUpdate(FixedStepGradientDescent(step_size), q)
-    # step_size_init * (step_size_beta + 1) / (step_size_beta + t)`
     update = ParamUpdate(GradientDescent(step_size, step_size_beta), q)
     (elbo_est, _, elbo_history) = black_box_vi!(
-        model, (),
+        heading_model, (),
         choicemap((:measured_heading, measured_heading)),
         q, (), update;
         iters=num_iters, samples_per_iter=samples_per_iter, verbose=verbose)
@@ -204,7 +202,7 @@ function vanilla_importance_sampling(measured_heading::Float64, num_importance_s
     xs = Float64[]
     ys = Float64[]
     (traces, log_normalized_weights, lml_estimate) = importance_sampling(
-        model, (), choicemap((:measured_heading, measured_heading)), num_importance_samples)
+        heading_model, (), choicemap((:measured_heading, measured_heading)), num_importance_samples)
     weights = exp.(log_normalized_weights)
     traces = [traces[categorical(weights)] for i in 1:num_samples]
     xs = Float64[trace[:x] for trace in traces]
@@ -348,7 +346,7 @@ function generate_simulative_aide_binned_results()
             println(map(length, traces_by_bin))
         end
         cur += 1
-        trace = simulate(model, ())
+        trace = simulate(heading_model, ())
         bin = get_bin(trace[:measured_heading])
         if length(traces_by_bin[bin]) < num_required
             push!(traces_by_bin[bin], trace)
@@ -412,7 +410,7 @@ function generate_plots_prior()
     xs = []
     ys = []
     for i in 1:200
-        trace = simulate(model, ())
+        trace = simulate(heading_model, ())
         push!(xs, trace[:x])
         push!(ys, trace[:y])
     end
@@ -427,7 +425,7 @@ function generate_plots_prior()
     figure(figsize=(6, 3), dpi=200)
     for i in 1:8
         subplot(2, 4, i)
-        trace = simulate(model, ())
+        trace = simulate(heading_model, ())
         scatter([trace[:x]], [trace[:y]], color="red", alpha=1.0, s=20, linestyle="-", linewidth=1)
         draw_heading(trace[:measured_heading]; color="blue", linestyle="--", linewidth=2)
         draw_heading(trace[]; color="blue")
@@ -514,7 +512,7 @@ function generate_plots_grid_lml(grid_results)
 
     close("all")
     figure(figsize=(6, 2), dpi=200)
-    scatter(bbvi_measured_headings, elbo_ests, s=20, alpha=0.5, color="blue")
+    scatter(bbvi_measured_headings, elbo_ests, s=20, alpha=0.5, color="teal")
     ylabel("ELBO estimate")
     xlabel("measured heading")
     gca().set_xlim((-pi, pi))
@@ -537,14 +535,14 @@ function generate_plots_grid_lml(grid_results)
         close("all")
         figure(figsize=(12, 3), dpi=200)
         subplot(1, 2, 1)
-        scatter(bbvi_measured_headings, elbo_ests, s=20, alpha=0.5, label="BBVI ELBO estimate", color="blue")
+        scatter(bbvi_measured_headings, elbo_ests, s=20, alpha=0.5, label="BBVI ELBO estimate", color="teal")
         scatter(vis_measured_headings, lml_ests, label="IS LML estimate", s=20, alpha=0.5, color="orange")
         legend()
         xlabel("measured heading")
         ylabel("ELBO and LML estimates")
         gca().set_xlim((-pi, pi))
         subplot(1, 2, 2)
-        scatter(vis_measured_headings, bbvi_kls, s=20, alpha=0.5, color="blue", label="BBVI KL estimate")
+        scatter(vis_measured_headings, bbvi_kls, s=20, alpha=0.5, color="teal", label="BBVI KL estimate")
         legend()
         ylabel("KL divergence est.")
         xlabel("measured heading")
@@ -576,28 +574,30 @@ function plot_binned_aide_results(results, show_bbvi, show_nn, show_raw_data, sh
     if show_nn
         if show_averages
             for (i, (x, y)) in enumerate(zip(headings_for_bins, nn_averages))
-                plot([x-(bin_width/2), x+(bin_width/2)], (y, y), color="red",
+                plot([x-(bin_width/2), x+(bin_width/2)], (y, y), color="purple",
                     label=(i == 1 && show_both ? "NN" : nothing))
             end
         end
         if show_raw_data
-            scatter(results["nn_headings"], results["nn_estimates"], color="red", s=1, alpha=0.1,
+            scatter(results["nn_headings"], results["nn_estimates"], color="purple", s=1, alpha=0.1,
                 label=(show_both ? "NN" : nothing))
         end
     end
     if show_bbvi
         if show_averages
             for (i, (x, y)) in enumerate(zip(headings_for_bins, bbvi_averages))
-                plot([x-(bin_width/2), x+(bin_width/2)], (y, y), color="blue",
+                plot([x-(bin_width/2), x+(bin_width/2)], (y, y), color="teal",
                     label=(i == 1 && show_both ? "BBVI" : nothing))
             end
         end
         if show_raw_data
-            scatter(results["bbvi_headings"], results["bbvi_estimates"], color="blue", s=2, alpha=0.5,
+            scatter(results["bbvi_headings"], results["bbvi_estimates"], color="teal", s=2, alpha=0.5,
                 label=(show_both ? "BBVI" : nothing))
         end
     end
-    legend()
+    if show_both
+        legend()
+    end
     xlabel("measured heading")
     ylabel("Symmetric KL divergence est.")
     gca().set_xlim((-pi, pi))
@@ -631,7 +631,7 @@ function generate_binning_animation()
             animation_idx += 1
         end
         cur += 1
-        trace = simulate(model, ())
+        trace = simulate(heading_model, ())
         bin = get_bin(trace[:measured_heading])
         if length(traces_by_bin[bin]) < num_required
             push!(traces_by_bin[bin], trace)
@@ -655,7 +655,7 @@ function occluded(x, y, occluder::Occluder)
     return (x > occluder.x) && (occluder.ymin < y_proj < occluder.ymax)
 end
 
-@gen function occluder_model(k, occluders)
+@gen function occluder_heading_model(k, occluders)
     x ~ normal(1.0, 1.0)
     y ~ normal(0.0, 1.0)
     theta = atan(y, x)
@@ -688,7 +688,7 @@ end
 function show_occluder_posterior(measurement, occluders)
     obs_choices = measurement_to_choicemap(measurement)
     (traces, log_normalized_weights, lml_estimate) = importance_sampling(
-        occluder_model, (100.0, occluders), obs_choices, 10000)
+        occluder_heading_model, (100.0, occluders), obs_choices, 10000)
     weights = exp.(log_normalized_weights)
     traces = [traces[categorical(weights)] for i in 1:500]
     xs = Float64[trace[:x] for trace in traces]
@@ -749,7 +749,7 @@ plot_binned_aide_results(binned_aide_results, true, false, false, true, (0, 8), 
 plot_binned_aide_results(binned_aide_results, false, true, true, false, (-5, 200), "binned_kl_estimates_nn_only_raw_data.png")
 plot_binned_aide_results(binned_aide_results, true, true, false, true, (0, 40), "binned_kl_estimates_averages.png")
 
-generate_binning_animation()
-occlusion_example()
+#generate_binning_animation()
+#occlusion_example()
 
 close("all")

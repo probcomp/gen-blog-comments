@@ -41,9 +41,9 @@ end
 
 const von_mises = VonMises()
 
-####################
-# generative model #
-####################
+#############################
+# original generative model #
+#############################
 
 @gen function heading_model()
     x ~ normal(1.0, 1.0)
@@ -51,6 +51,54 @@ const von_mises = VonMises()
     heading = atan(y, x)
     measured_heading ~ von_mises(heading, 100.0)
     return heading
+end
+
+###################################
+# generative model with occluders #
+###################################
+
+struct Occluder
+    x::Float64
+    ymin::Float64
+    ymax::Float64
+end
+
+function occluded(x, y, occluder::Occluder)
+    @assert occluder.ymin < occluder.ymax
+    y_proj = (y / x) * occluder.x
+    return (x > occluder.x) && (occluder.ymin < y_proj < occluder.ymax)
+end
+
+@gen function occluder_heading_model(occluders)
+    x ~ normal(1.0, 1.0)
+    y ~ normal(0.0, 1.0)
+    theta = atan(y, x)
+    if any([occluded(x, y, occ) for occ in occluders])
+        # it is occluded, but may be false positive
+        is_detection ~ bernoulli(0.1)
+        if is_detection
+            measured_heading ~ von_mises(0.0, 0.00001)
+        end
+    else
+        # it is occluded, but may be false negative
+        is_detection ~ bernoulli(0.90)
+        if is_detection
+            measured_heading ~ von_mises(theta, 100.0)
+        end
+    end
+end
+
+const occluders = [Occluder(0.8, 0.5, 2.0), Occluder(0.3, -2.0, -1.0)]
+
+function measurement_to_choicemap(measurement)
+    obs = choicemap()
+    if measurement === nothing
+        obs[:is_detection] = false
+    else
+        obs[:is_detection] = true
+        obs[:measured_heading] = measurement
+    end
+    return obs
 end
 
 ###################################
@@ -89,8 +137,8 @@ end
 
 function train_q_amortized()
     adam_update = ParamUpdate(FluxOptimConf(Optimise.ADAM, (0.1, (0.9, 0.999))), q_amortized => [:b1, :W1, :b2, :W2, :b3, :W3])
-    num_hidden1 = 4
-    num_hidden2 = 4
+    num_hidden1 = 20
+    num_hidden2 = 20
     num_output = 6
     init_param!(q_amortized, :b1, zeros(num_hidden1))
     init_param!(q_amortized, :W1, randn(num_hidden1, 3) * 0.1)
@@ -163,20 +211,26 @@ function nn_inference(measured_heading::Float64, num_samples::Int)
 end
 
 function bbvi_inference(
-        q, measured_heading::Float64, num_samples::Int, num_iters::Int;
+        model, model_args,
+        q, observations, num_samples::Int, num_iters::Int;
         samples_per_iter=100, verbose=false, step_size=0.001, step_size_beta=100)
 
     # initialize parameters
-    init_param!(q, :x_mu, cos(measured_heading))
-    init_param!(q, :y_mu, sin(measured_heading))
+    if observations[:is_detection]
+        init_param!(q, :x_mu, cos(observations[:measured_heading]))
+        init_param!(q, :y_mu, sin(observations[:measured_heading]))
+    else
+        init_param!(q, :x_mu, 0.0)
+        init_param!(q, :y_mu, 0.0)
+    end
     init_param!(q, :x_log_std, 0.0)
     init_param!(q, :y_log_std, 0.0)
 
     # fit parameters using BBVI
     update = ParamUpdate(GradientDescent(step_size, step_size_beta), q)
     (elbo_est, _, elbo_history) = black_box_vi!(
-        heading_model, (),
-        choicemap((:measured_heading, measured_heading)),
+        model, model_args,
+        observations,
         q, (), update;
         iters=num_iters, samples_per_iter=samples_per_iter, verbose=verbose)
     x_mu = get_param(q, :x_mu)
@@ -286,8 +340,9 @@ function generate_grid_results()
     for num_iters in [10, 500]
         bbvi_results[num_iters] = []
         for (i, measured_heading) in enumerate(measured_headings)
+            observations = choicemap((:measured_heading, measured_heading))
             xs, ys, elbo_est = bbvi_inference(
-                q_axis_aligned_gaussian, measured_heading, num_posterior_samples, num_iters;
+                q_axis_aligned_gaussian, observations, num_posterior_samples, num_iters;
                 samples_per_iter=30, step_size=0.005, step_size_beta=100)
             push!(bbvi_results[num_iters], Dict(
                 "measured_heading" => measured_heading,
@@ -324,17 +379,45 @@ end
 
 include("simulated_data_aide.jl")
 
-function bbvi_fit_posterior(observations)
-    bbvi_inference(q_axis_aligned_gaussian, observations[:measured_heading], 0, 500;
-                samples_per_iter=30, step_size=0.005, step_size_beta=100)
-    return q_axis_aligned_gaussian
+function generate_simulative_aide_results()
+
+    println("generating simulated data...")
+    traces = []
+    for i in 1:1000
+        push!(traces, simulate(heading_model, ()))
+    end
+
+    # BBVI
+    println("running AIDE for BBVI...")
+    bbvi_estimates = Float64[]
+    bbvi_headings = Float64[]
+    cur = 1
+    for trace in traces
+        println(cur)
+        cur += 1
+        estimate, _, _ = simulative_aide(
+            trace, select(:measured_heading),
+            (observations) -> begin
+                bbvi_inference(
+                    heading_model, (),
+                    q_axis_aligned_gaussian, observations, 0, 500;
+                    samples_per_iter=30, step_size=0.005, step_size_beta=100)
+                return q_axis_aligned_gaussian
+            end, (observations) -> ())
+        push!(bbvi_estimates, estimate)
+        push!(bbvi_headings, trace[:measured_heading])
+    end
+
+    return Dict(
+        "bbvi_headings" => bbvi_headings,
+        "bbvi_estimates" => bbvi_estimates)
 end
+
 
 function generate_simulative_aide_binned_results()
 
     num_bins = 64
     get_bin(heading) = Int(ceil((heading + pi) / (pi/32)))
-    bin_to_heading(bin) = (bin-1) * (pi/32) - pi
 
     println("generating simulated data...")
     traces_by_bin = [[] for bin in 1:num_bins]
@@ -378,13 +461,21 @@ function generate_simulative_aide_binned_results()
         @time for trace in traces_by_bin[bin][1:100]
             estimate, _, _ = simulative_aide(
                 trace, select(:measured_heading),
-                bbvi_fit_posterior, (observations) -> ())
+                (observations) -> begin
+                    bbvi_inference(
+                        heading_model, (),
+                        q_axis_aligned_gaussian, observations, 0, 500;
+                        samples_per_iter=30, step_size=0.005, step_size_beta=100)
+                    return q_axis_aligned_gaussian
+                end,
+                (observations) -> ())
             push!(bbvi_estimates_by_bin[bin], estimate)
             push!(bbvi_estimates, estimate)
             push!(bbvi_headings, trace[:measured_heading])
         end
     end
 
+    bin_to_heading(bin) = (bin-1) * (pi/32) - pi
     headings_for_bins = Float64[bin_to_heading(bin) for bin in 1:num_bins]
     return Dict(
         "headings_for_bins" => headings_for_bins,
@@ -396,6 +487,63 @@ function generate_simulative_aide_binned_results()
         "nn_estimates_by_bin" => nn_estimates_by_bin)
 end
 
+function generate_simulative_aide_binned_results_occluders()
+
+    num_bins = 64
+    bin_no_detection = num_bins + 1
+    get_bin(trace) = trace[:is_detection] ? Int(ceil((trace[:measured_heading] + pi) / (pi/32))) : bin_no_detection
+
+    println("generating simulated data...")
+    traces_by_bin = [[] for bin in 1:num_bins] # for detection
+    push!(traces_by_bin, []) # for no detection
+    Random.seed!(1)
+    num_required = 100
+    cur = 1
+    @time while minimum(map(length, traces_by_bin)) < num_required
+        if (cur % 1000) == 0
+            println(map(length, traces_by_bin))
+        end
+        cur += 1
+        trace = simulate(occluder_heading_model, (occluders,))
+        bin = get_bin(trace)
+        if length(traces_by_bin[bin]) < num_required
+            push!(traces_by_bin[bin], trace)
+        end
+    end
+
+    # BBVI
+    println("running AIDE for BBVI...")
+    bbvi_estimates = Float64[]
+    bbvi_headings = Any[] # nothing if no detection otherwise float
+    bbvi_estimates_by_bin = [Float64[] for bin in 1:num_bins+1]
+    for bin in 1:num_bins+1
+        @time for trace in traces_by_bin[bin][1:100]
+            estimate, _, _ = simulative_aide(
+                trace, select(:is_detection, :measured_heading),
+                (observations) -> begin
+                    bbvi_inference(
+                        occluder_heading_model, (occluders,),
+                        q_axis_aligned_gaussian, observations, 0, 500;
+                        samples_per_iter=30, step_size=0.005, step_size_beta=100)
+                    return q_axis_aligned_gaussian
+                end,
+                (observations) -> ())
+            push!(bbvi_estimates_by_bin[bin], estimate)
+            push!(bbvi_estimates, estimate)
+            push!(bbvi_headings, trace[:is_detection] ? trace[:measured_heading] : nothing)
+        end
+    end
+
+    bin_to_heading(bin) = (bin == bin_no_detection) ? nothing : (bin-1) * (pi/32) - pi
+    headings_for_bins = [bin_to_heading(bin) for bin in 1:num_bins+1]
+    return Dict(
+        "headings_for_bins" => headings_for_bins,
+        "bbvi_headings" => bbvi_headings,
+        "bbvi_estimates" => bbvi_estimates,
+        "bbvi_estimates_by_bin" => bbvi_estimates_by_bin)
+end
+
+
 
 ##################
 # generate plots #
@@ -406,17 +554,19 @@ function generate_plots_prior()
     # prior on location of object
     close("all")
     Random.seed!(1)
-    figure(figsize=(2, 2), dpi=400)
+    figure(figsize=(4, 4), dpi=200)
     xs = []
     ys = []
-    for i in 1:200
+    for i in 1:500
         trace = simulate(heading_model, ())
         push!(xs, trace[:x])
         push!(ys, trace[:y])
     end
-    scatter(xs, ys, color="red", alpha=0.2, s=5)
+    scatter(xs, ys, color="red", alpha=0.3, s=10)
+    title("prior")
     draw_robot()
     set_bounds()
+    tight_layout()
     savefig("prior-overlay.png")
 
     # prior on location of object and simulated measurement
@@ -554,13 +704,21 @@ function generate_plots_grid_lml(grid_results)
     end
 end
 
+function plot_unbinned_aide_results(results, ylim, fname)
+    close("all")
+    figure(figsize=(6, 2), dpi=200)
+    scatter(results["bbvi_headings"], results["bbvi_estimates"], color="teal", s=2, alpha=0.5)
+    xlabel("measured heading")
+    ylabel("Symmetric KL divergence est.")
+    gca().set_xlim((-pi, pi))
+    gca().set_ylim(ylim)
+    savefig(fname)
+end
+
+
 function plot_binned_aide_results(results, show_bbvi, show_nn, show_raw_data, show_averages, ylim, fname)
 
     headings_for_bins = results["headings_for_bins"]
-    bbvi_estimates_by_bin = results["bbvi_estimates_by_bin"]
-    bbvi_averages = map((arr) -> sum(arr)/length(arr), bbvi_estimates_by_bin)
-    nn_estimates_by_bin = results["nn_estimates_by_bin"]
-    nn_averages = map((arr) -> sum(arr)/length(arr), nn_estimates_by_bin)
 
     close("all")
     if show_nn
@@ -573,25 +731,47 @@ function plot_binned_aide_results(results, show_bbvi, show_nn, show_raw_data, sh
     show_both = show_nn && show_bbvi
     if show_nn
         if show_averages
+            nn_estimates_by_bin = results["nn_estimates_by_bin"]
+            nn_averages = map((arr) -> sum(arr)/length(arr), nn_estimates_by_bin)
             for (i, (x, y)) in enumerate(zip(headings_for_bins, nn_averages))
-                plot([x-(bin_width/2), x+(bin_width/2)], (y, y), color="purple",
-                    label=(i == 1 && show_both ? "NN" : nothing))
+                if x == nothing
+                    plot([0-(bin_width/2), 0+(bin_width/2)], (y, y), color="black",
+                        label=(i == 1 && show_both ? "NN" : nothing), linewidth=2)
+                else
+                    plot([x-(bin_width/2), x+(bin_width/2)], (y, y), color="orangered",
+                        label=(i == 1 && show_both ? "NN" : nothing))
+                end
             end
         end
         if show_raw_data
-            scatter(results["nn_headings"], results["nn_estimates"], color="purple", s=1, alpha=0.1,
+            scatter(
+                [h == nothing ? 0.0 : h in results["nn_headings"]],
+                results["bbvi_estimates"],
+                color=[h == nothing ? "black" : "orangered" for h in results["nn_headings"]],
+                s=2, alpha=0.5,
                 label=(show_both ? "NN" : nothing))
         end
     end
     if show_bbvi
         if show_averages
+            bbvi_estimates_by_bin = results["bbvi_estimates_by_bin"]
+            bbvi_averages = map((arr) -> sum(arr)/length(arr), bbvi_estimates_by_bin)
             for (i, (x, y)) in enumerate(zip(headings_for_bins, bbvi_averages))
-                plot([x-(bin_width/2), x+(bin_width/2)], (y, y), color="teal",
-                    label=(i == 1 && show_both ? "BBVI" : nothing))
+                if x == nothing
+                    plot([0-(bin_width), 0+(bin_width)], (y, y), color="black",
+                        label=(i == 1 && show_both ? "BBVI" : nothing), linewidth=3)
+                else
+                    plot([x-(bin_width/2), x+(bin_width/2)], (y, y), color="teal",
+                        label=(i == 1 && show_both ? "BBVI" : nothing))
+                end
             end
         end
         if show_raw_data
-            scatter(results["bbvi_headings"], results["bbvi_estimates"], color="teal", s=2, alpha=0.5,
+            scatter(
+                [h == nothing ? 0.0 : h for h in results["bbvi_headings"]],
+                results["bbvi_estimates"],
+                color=[h == nothing ? "black" : "teal" for h in results["bbvi_headings"]],
+                s=2, alpha=0.5,
                 label=(show_both ? "BBVI" : nothing))
         end
     end
@@ -602,6 +782,7 @@ function plot_binned_aide_results(results, show_bbvi, show_nn, show_raw_data, sh
     ylabel("Symmetric KL divergence est.")
     gca().set_xlim((-pi, pi))
     gca().set_ylim(ylim)
+    tight_layout()
     savefig(fname)
 end
 
@@ -639,56 +820,10 @@ function generate_binning_animation()
     end
 end
 
-##################
-# occluder model #
-##################
-
-struct Occluder
-    x::Float64
-    ymin::Float64
-    ymax::Float64
-end
-
-function occluded(x, y, occluder::Occluder)
-    @assert occluder.ymin < occluder.ymax
-    y_proj = (y / x) * occluder.x
-    return (x > occluder.x) && (occluder.ymin < y_proj < occluder.ymax)
-end
-
-@gen function occluder_heading_model(k, occluders)
-    x ~ normal(1.0, 1.0)
-    y ~ normal(0.0, 1.0)
-    theta = atan(y, x)
-    if any([occluded(x, y, occ) for occ in occluders])
-        # it is occluded, but may be false positive
-        is_detection ~ bernoulli(0.1)
-        if is_detection
-            measured_heading ~ von_mises(0.0, 0.00001)
-        end
-    else
-        # it is occluded, but may be false negative
-        is_detection ~ bernoulli(0.90)
-        if is_detection
-            measured_heading ~ von_mises(theta, k)
-        end
-    end
-end
-
-function measurement_to_choicemap(measurement)
-    obs = choicemap()
-    if measurement === nothing
-        obs[:is_detection] = false
-    else
-        obs[:is_detection] = true
-        obs[:measured_heading] = measurement
-    end
-    return obs
-end
-
 function show_occluder_posterior(measurement, occluders)
     obs_choices = measurement_to_choicemap(measurement)
     (traces, log_normalized_weights, lml_estimate) = importance_sampling(
-        occluder_heading_model, (100.0, occluders), obs_choices, 10000)
+        occluder_heading_model, (occluders,), obs_choices, 10000)
     weights = exp.(log_normalized_weights)
     traces = [traces[categorical(weights)] for i in 1:500]
     xs = Float64[trace[:x] for trace in traces]
@@ -710,19 +845,38 @@ end
 
 function occlusion_example()
 
-    figure()
+    figure(figsize=(4,4), dpi=200)
     show_occluder_posterior(nothing, [Occluder(0.8, 0.5, 2.0), Occluder(0.3, -2.0, -1.0)])
     tight_layout()
     savefig("occlusion-no-detection.png")
     close("all")
 
-    figure(figsize=(32, 8), dpi=100)
+    figure(figsize=(12, 12), dpi=250)
     for (i, measurement) in enumerate(range(-pi, stop=pi, length=16))
-        subplot(2, 8, i)
+        subplot(4, 4, i)
         show_occluder_posterior(measurement, [Occluder(0.8, 0.5, 2.0), Occluder(0.3, -2.0, -1.0)])
     end
     tight_layout()
     savefig("occlusion-detections.png")
+    close("all")
+
+    figure(figsize=(4,4), dpi=200)
+    xs, ys, elbo_est, history = bbvi_inference(
+        occluder_heading_model, (occluders,),
+        q_axis_aligned_gaussian, choicemap((:is_detection, false)), 400, 500;
+        samples_per_iter=30, step_size=0.005, step_size_beta=100)
+    scatter(xs, ys, color="red", alpha=0.3, s=10)
+    for occluder in occluders
+        plot([occluder.x, occluder.x], [occluder.ymin, occluder.ymax], linewidth=3, color="black")
+    end
+    draw_robot()
+    set_bounds()
+    tight_layout()
+    savefig("bbvi-occluders-no-detection.png")
+
+    figure()
+    plot(history)
+    savefig("bbvi-occluders-history.png")
     close("all")
 end
 
@@ -730,6 +884,8 @@ end
 ###############
 # entry-point #
 ###############
+
+generate_plots_prior()
 
 train_q_amortized()
 load_q_amortized_params()
@@ -740,6 +896,11 @@ grid_results = load("grid_results.jld")["grid_results"]
 generate_plots_posterior(grid_results)
 generate_plots_grid_lml(grid_results)
 
+unbinned_aide_results = generate_simulative_aide_results()
+save("simulative_aide_results.jld", unbinned_aide_results)
+unbinned_aide_results = load("simulative_aide_results.jld")
+plot_unbinned_aide_results(unbinned_aide_results, (-8, 25), "unbinned_kl_estimates_bbvi_only_raw_data.png")
+
 binned_aide_results = generate_simulative_aide_binned_results()
 save("simulative_aide_binned_results.jld", binned_aide_results)
 binned_aide_results = load("simulative_aide_binned_results.jld")
@@ -749,7 +910,14 @@ plot_binned_aide_results(binned_aide_results, true, false, false, true, (0, 8), 
 plot_binned_aide_results(binned_aide_results, false, true, true, false, (-5, 200), "binned_kl_estimates_nn_only_raw_data.png")
 plot_binned_aide_results(binned_aide_results, true, true, false, true, (0, 40), "binned_kl_estimates_averages.png")
 
-#generate_binning_animation()
-#occlusion_example()
+generate_binning_animation()
+occlusion_example()
+
+binned_aide_results_occluders = generate_simulative_aide_binned_results_occluders()
+save("simulative_aide_binned_results_occluders.jld", binned_aide_results_occluders)
+
+binned_aide_results_occluders = load("simulative_aide_binned_results_occluders.jld")
+plot_binned_aide_results(binned_aide_results_occluders, true, false, true, false, (-8, 50), "binned_kl_estimates_bbvi_only_raw_data_occluders.png")
+plot_binned_aide_results(binned_aide_results_occluders, true, false, false, true, (0, 15), "binned_kl_estimates_bbvi_only_averages_occluders.png")
 
 close("all")
